@@ -97,7 +97,10 @@ class AMQPLibConnector extends AbstractAMQPConnector
             null,
             'en_US',
             $details['socket_connect_timeout'],
-            $details['socket_timeout']
+            $details['socket_timeout'],
+            $details['context'],
+            $details['keepalive'],
+            $details['heartbeat']
         );
 
         $this->waitChan = new \chan(1);

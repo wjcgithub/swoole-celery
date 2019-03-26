@@ -103,8 +103,7 @@ class Celery extends CeleryAbstract
                          $exchange = 'celery', $binding = 'celery', $port = 5672,
                          $confirmAckCallback = null, $confirmNAckCallback = null, $returnCallback = null,
                          $connector = false, $result_expire = 0, $socket_connect_timeout = 3.0, $socket_timeout = 3.0,
-                         $persistent_messages = false,
-                         $ssl_options = array())
+                         $persistent_messages = false, $ssl_options = array(), $context = null, $keepalive = false, $heartbeat = 0)
     {
         $broker_connection = array(
             'host' => $host,
@@ -122,6 +121,9 @@ class Celery extends CeleryAbstract
             'socket_connect_timeout' => $socket_connect_timeout,
             'socket_timeout' => $socket_timeout,
             'ssl_options' => $ssl_options,
+            'context' => $context,
+            'keepalive' => $keepalive,
+            'heartbeat' => $heartbeat
         );
         $backend_connection = $broker_connection;
 
@@ -166,11 +168,13 @@ abstract class CeleryAbstract
     private $backend_connection = null;
     private $backend_connection_details = array();
     private $backend_amqp = null;
-
     private $origin = null;
-
     private $isConnected = false;
 
+    /**
+     * check broker connection
+     * @return mixed
+     */
     public function getBrokerConnectStatus()
     {
         return $this->broker_connection->isConnected();
@@ -183,14 +187,16 @@ abstract class CeleryAbstract
             "vhost" => "", "exchange" => "celery", "binding" => "celery",
             "port" => 5672, 'confirm_ack_callback' => [], 'confirm_nack_callback' => [],
             'return_callback' => [], "connector" => false, "persistent_messages" => false,
-            "result_expire" => 0, 'socket_connect_timeout' => 3.0, 'socket_timeout' => 3.0, "ssl_options" => array());
+            "result_expire" => 0, 'socket_connect_timeout' => 3.0, 'socket_timeout' => 3.0,
+            "ssl_options" => array(), 'context' => null, 'keepalive' => false, 'heartbeat' => 0
+        );
 
         $returnValue = array();
 
         foreach (array('host', 'login', 'password', 'vhost', 'exchange', 'binding', 'port',
                      'confirm_ack_callback', 'confirm_nack_callback', 'return_callback', 'connector',
                      'persistent_messages', 'result_expire', "result_expire", 'socket_connect_timeout',
-                     'socket_timeout', 'ssl_options') as $detail) {
+                     'socket_timeout', 'ssl_options', 'context', 'keepalive', 'heartbeat') as $detail) {
             if (!array_key_exists($detail, $details)) {
                 $returnValue[$detail] = $defaultValues[$detail];
             } else $returnValue[$detail] = $details[$detail];
