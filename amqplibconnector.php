@@ -42,9 +42,12 @@
 
 require_once('amqp.php');
 
+use App\Utils\MqConfirm;
 use Dtsf\Core\Log;
 use Dtsf\Core\WorkerApp;
 use PhpAmqpLib\Connection\AMQPConnection;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 
@@ -55,37 +58,38 @@ use PhpAmqpLib\Wire\AMQPTable;
  */
 class AMQPLibConnector extends AbstractAMQPConnector
 {
+    const workerStop = 3;
     /**
      * How long (in seconds) to wait for a message from queue
      * Sadly, this can't be set to zero to achieve complete asynchronity
      */
     public $wait_timeout = 0.1;
-
+    
     private $connection = null;
     private $connectionDetails = [];
     private $channels = [];
-    private $confirmTick = '';
-    private $confirmAckTickTime = 5000; //单位s
-    private $confirmAckTickTimeRandArr = [4500, 5000, 5500, 6000, 6500];
+    private $confirmTickStatus = true;   //true 可处理, false 处理中
+    private $confirmTick = 0;
+    private $confirmAckTickTime = 1000; //单位s
     private $wokerStopFlag = 1;
     private $waitChan = null;  //该chan为了等待连接池中链接达到最大空闲时间后gc的时候等待最后ack完成在返回true, 否则该链接对象会被直接unset
-
-
+    private $confirmMode = 0;
+    private $chanNum = 1;
+    
+    
     /**
      * PhpAmqpLib\Message\AMQPMessage object received from the queue
      */
     private $message = null;
-
+    
     /**
      * AMQPChannel object cached for subsequent GetMessageBody() calls
      */
     private $receiving_channel = null;
-
+    
     function GetConnectionObject($details)
     {
-        $this->confirmAckTickTime = $this->confirmAckTickTimeRandArr[array_rand($this->confirmAckTickTimeRandArr)];
         $this->connectionDetails = $details;
-        $this->channels[$details['exchange']] = new \chan();
         $this->connection = new AMQPConnection(
             $details['host'],
             $details['port'],
@@ -102,13 +106,14 @@ class AMQPLibConnector extends AbstractAMQPConnector
             $details['keepalive'],
             $details['heartbeat']
         );
-
+        
         $this->waitChan = new \chan(1);
+        $this->channels[$details['exchange']] = new \chan(2);
         $this->setChannel($details['exchange']);
         return $this->connection;
     }
-
-
+    
+    
     /**
      * 创建一个channel
      *
@@ -116,54 +121,62 @@ class AMQPLibConnector extends AbstractAMQPConnector
      */
     private function setChannel($exchange)
     {
-        if ($this->channels[$exchange]->isEmpty()) {
+        if (!empty($this->connectionDetails['return_callback']) ||
+            !empty($this->connectionDetails['confirm_ack_callback']) ||
+            !empty($this->connectionDetails['confirm_nack_callback'])
+        ) {
+            $this->confirmMode = 1;
+        }
+        
+        for ($i = 0; $i < $this->chanNum; $i++) {
             $channel = $this->connection->channel();
-            $this->pushChan($channel, $exchange);
-            //判断是否开启的ack,return回调
-            if (!empty($this->connectionDetails['confirm_ack_callback'])) {
-                $channel->set_ack_handler(
-                    function (AMQPMessage $message) {
-                        if (is_callable($this->connectionDetails['confirm_ack_callback'])) {
-                            call_user_func($this->connectionDetails['confirm_ack_callback'], $message);
-                        }
-                    }
-                );
-            }
-
-            if (!empty($this->connectionDetails['confirm_nack_callback'])) {
-                $channel->set_nack_handler(
-                    function (AMQPMessage $message) {
-                        if (is_callable($this->connectionDetails['confirm_nack_callback'])) {
-                            call_user_func($this->connectionDetails['confirm_nack_callback'], $message);
-                        }
-                    }
-                );
-            }
-
-            if (!empty($this->connectionDetails['return_callback'])) {
-                $channel->set_return_listener(function ($replyCode, $replyText, $exchange, $routingKey, $message) {
-                    if (is_callable($this->connectionDetails['return_callback'])) {
-                        call_user_func_array($this->connectionDetails['return_callback'], [
-                            $replyCode,
-                            $replyText,
-                            $exchange,
-                            $routingKey,
-                            $message
-                        ]);
-                    }
-                });
-            }
-
-            if (!empty($this->connectionDetails['return_callback']) ||
-                !empty($this->connectionDetails['confirm_ack_callback']) ||
-                !empty($this->connectionDetails['confirm_nack_callback'])
-            ) {
-                $channel->confirm_select();
-                $this->listenEvent();
-            }
+            $this->storeChan($channel, $exchange);
+        }
+        
+        if ($this->confirmMode) {
+            $this->listenEvent();
         }
     }
-
+    
+    /**
+     * 保存chan
+     * @param $channel
+     * @param $exchange
+     */
+    private function storeChan($channel, $exchange)
+    {
+        if ($this->confirmMode) {
+            $channel->set_nack_handler(
+                function (AMQPMessage $message) {
+                    if (is_callable($this->connectionDetails['confirm_nack_callback'])) {
+                        call_user_func($this->connectionDetails['confirm_nack_callback'], $message);
+                    }
+                }
+            );
+            $channel->set_ack_handler(
+                function (AMQPMessage $message) {
+                    if (is_callable($this->connectionDetails['confirm_ack_callback'])) {
+                        call_user_func($this->connectionDetails['confirm_ack_callback'], $message);
+                    }
+                }
+            );
+            $channel->set_return_listener(function ($replyCode, $replyText, $exchange, $routingKey, $message) {
+                if (is_callable($this->connectionDetails['return_callback'])) {
+                    call_user_func_array($this->connectionDetails['return_callback'], [
+                        $replyCode,
+                        $replyText,
+                        $exchange,
+                        $routingKey,
+                        $message
+                    ]);
+                }
+            });
+            $channel->confirm_select();
+        }
+        $this->pushChan($channel, $exchange);
+    }
+    
+    
     /**
      * 清空当前链接的所有chan
      */
@@ -171,53 +184,70 @@ class AMQPLibConnector extends AbstractAMQPConnector
     {
         $this->channels = [];
     }
-
+    
     /**
      * channel 监听
      */
     private function listenEvent()
     {
+        if ($this->confirmTick) {
+            $this->cleanTimer();
+        }
         $this->confirmTick = swoole_timer_tick($this->confirmAckTickTime, [$this, 'handlerConfirm']);
     }
-
+    
     /**
      * clean timer
      */
     private function cleanTimer()
     {
-        swoole_timer_clear($this->confirmTick);
+        if ($this->confirmTick > 0) {
+            swoole_timer_clear($this->confirmTick);
+            $this->confirmTick = -1;
+        }
     }
-
+    
     /**
      * 处理监听程序,时间回调默认在协程中启动
+     * 根据定时时间周期执行
+     * 直到worker退出事件触发, 并标识workerStopFlag为3, 此时清除定时器,并断开链接
      */
     public function handlerConfirm()
     {
-        try{
-            $chan = $this->popChan($this->connectionDetails['exchange'],0.01);
-            if ($chan->getConnection()->isConnected()) {
+        try {
+            if (!$this->connection->isConnected()) {
+                $this->cleanTimer();
+            }
+            //如果还在处理中那么直接返回
+            if (!$this->confirmTickStatus) {
+                return;
+            }
+            $this->confirmTickStatus = false;
+            $chan = $this->popChan($this->connectionDetails['exchange'], 0.01, $beforeUseTryTimes = 3);
+            if (!empty($chan) && $chan->getConnection()->isConnected()) {
                 $chan->wait_for_pending_acks_returns();
                 //要执行下面if中的语句,说明gc执行后最后一次confirm已经执行完毕 line217
-                if ($this->getListenWokerStopFlag() == 3) {
+                if ($this->getWokerStopFlag() == self::workerStop) {
                     //不能断开该链接,因为协程可能还没执行完毕
                     \Swoole\Coroutine::sleep(2);
-                    $chan->close();
                     $this->ackFinish();
-                } else {
-                    $this->channels[$this->connectionDetails['exchange']]->push($chan);
                 }
             }
+            $this->confirmTickStatus = true;
+            $this->pushChan($chan);
         } catch (\Throwable $throwable) {
+            $this->connection->close();
+            $this->confirmTickStatus = true;
             Log::error("{worker_id} ack error on handlerConfirm, and current app status is {status}, msg: {msg}."
                 , [
                     '{worker_id}' => posix_getpid(),
-                    '{status}'=>WorkerApp::getInstance()->serverStatus,
-                    '{msg}'=> $throwable->getMessage().'====trace:'.$throwable->getTraceAsString()
+                    '{status}' => WorkerApp::getInstance()->serverStatus,
+                    '{msg}' => $throwable->getMessage() . '====trace:' . $throwable->getTraceAsString()
                 ]
                 , WorkerApp::getInstance()->ackErrorDirName);
         }
     }
-
+    
     /**
      * 获取一个chann
      *
@@ -225,122 +255,127 @@ class AMQPLibConnector extends AbstractAMQPConnector
      * @param int $beforeUseTryTimes
      * @return mixed
      */
-    private function popChan($exchange, $popTime = 0.1, $beforeUseTryTimes = 3)
+    private function popChan($exchange, $popTime = 0.1, $retryTimes = 500)
     {
-//        if (!$this->connection->isConnected()) {
-//            Log::debug('pid:{worker_id} goto reconnection mq'.$popTime.'----beforeUseTryTimes'.$beforeUseTryTimes,
-//                ['{worker_id}'=>posix_getpid()], 'pop_channel');
-//            if ($beforeUseTryTimes <= 0) {
-//                $this->cleanChan();
-//                $this->GetConnectionObject($this->connectionDetails);
-//            }
-//            return $this->popChan($exchange, $beforeUseTryTimes - 1);
-//        }else{
-//            Log::debug('pid:{worker_id} check connection fail , and poptime is'.$popTime.'----beforeUseTryTimes'.$beforeUseTryTimes,
-//                ['{worker_id}'=>posix_getpid()], 'check_connection');
-//        }
         $channel = $this->channels[$exchange]->pop($popTime);
-        if (!is_object($channel)) {
-            Log::debug('pid:{worker_id} objhash is {obj} reget channel of mq'.$popTime.'----beforeUseTryTimes'.$beforeUseTryTimes,
-                ['{worker_id}'=>posix_getpid()], 'pop_channel');
-            \Swoole\Coroutine::sleep(0.01);
-            return $this->popChan($exchange, $popTime, $beforeUseTryTimes);
+        if ($retryTimes <= 0) {
+            if (empty($channel)) {
+                $this->cleanTimer();
+                $this->GetConnectionObject($this->connectionDetails);
+            }
+            
+            return null;
         }
-
+        if (!is_object($channel) && $this->connection->isConnected() && $this->confirmTick > 0) {
+            Log::warning('pid:{worker_id} objhash is {obj} reget channel of mq:' . $popTime . '--retryTimes:' . $retryTimes,
+                ['{worker_id}' => posix_getpid()], 'pop_channel');
+            return $this->popChan($exchange, $popTime, $retryTimes--);
+        }
+        
         return $channel;
     }
-
+    
     /**
      * 该链接是供confirm和publish message使用
      * @param $chan
+     * @param $exchange
+     * @param $type 类型 post | confirm
      */
-    private function pushChan($chan, $exchange=null)
+    private function pushChan($chan, $exchange = null)
     {
         if (empty($exchange)) {
             $exchange = $this->connectionDetails['exchange'];
         }
         $this->channels[$exchange]->push($chan);
     }
-
+    
+    /**
+     * @param null $exchange
+     * @return mixed
+     */
+    public function getChanLength($exchange = null)
+    {
+        if (empty($exchange)) {
+            $exchange = $this->connectionDetails['exchange'];
+        }
+        return $this->channels[$exchange]->length();
+    }
+    
     /**
      * gc 只会调用一次, worker退出会频繁调用,直到worker退出,
      */
     public function workerExitHandlerConfirm()
     {
-        try{
+        try {
             go(function () {
-                $chan = $this->popChan($this->connectionDetails['exchange'], 0.5);
+                $this->cleanTimer();
+                $chan = $this->popChan($this->connectionDetails['exchange'], 0.01);
                 //正常的gc机制,某个连接对象在执行gc的时候只会执行一次
-                if ($chan && $this->wokerStopFlag !== 3) {
+                if (!empty($chan) && $this->getWokerStopFlag() !== self::workerStop) {
                     $chan->wait_for_pending_acks_returns();
+                    $this->setWokerStopFlag(self::workerStop);
                     $this->pushChan($chan);
-                    Log::debug("worker {worker_id} execting lask ack on workerExitHandlerConfirm, and current app status is {status}."
-                        , ['{worker_id}' => posix_getpid(), '{status}'=>WorkerApp::getInstance()->serverStatus]
-                        , WorkerApp::getInstance()->debugDirName);
-                    //设置停止flag
-                    $this->wokerStopFlag = 3;
                 }
             });
-
-            //如果是进程退出导致的，就不用阻塞等待，因为进程退出检测还有event会频繁请求,
-            // 相反如果是链接池资源回收的请求只触发一次workerExitHandlerConfirm，并立刻删除该对象，
-            // 所以要阻塞等待最后一次timer回收ack的事件完成在去gc中unset()当前链接对象
-            if (WorkerApp::getInstance()->serverStatus !== WorkerApp::WORKEREXIT) {
-                Log::debug("worker {worker_id} wait ack finish, and current app status is {status}."
-                    , ['{worker_id}' => posix_getpid(), '{status}'=>WorkerApp::getInstance()->serverStatus]
-                    , WorkerApp::getInstance()->debugDirName);
-                return $this->waitToStop();
-            }
         } catch (\Throwable $throwable) {
             Log::error("{worker_id} ack error on workerExitHandlerConfirm, and current app status is {status}, msg: {msg}."
                 , [
                     '{worker_id}' => posix_getpid(),
-                    '{status}'=>WorkerApp::getInstance()->serverStatus,
-                    '{msg}'=> $throwable->getMessage().'====trace:'.$throwable->getTraceAsString()
+                    '{status}' => WorkerApp::getInstance()->serverStatus,
+                    '{msg}' => $throwable->getMessage() . '====trace:' . $throwable->getTraceAsString()
                 ]
                 , WorkerApp::getInstance()->ackErrorDirName);
         }
     }
-
+    
     /**
-     * 等待最后ack退出
+     * 等待最后一次timer执行wait_for_pending_acks_returns, 并退出
      * @return mixed
      */
     private function waitToStop()
     {
         return $this->waitChan->pop();
     }
-
+    
     /**
      * 完成最后ack
      */
     private function ackFinish()
     {
+        $this->cleanTimer();
         //不能断开该链接,因为协程可能还没执行完毕
         $this->connection->close();
         //设置worker状态为确认最后ack完成
-        WorkerApp::getInstance()->setWorkerStatus(WorkerApp::WORKERLASTACK);
         $this->waitChan->push(1);
-        $this->cleanTimer();
-        Log::debug("worker {worker_id} exec last ack at tick, and current app status is {status}.",
-            ['{worker_id}' => posix_getpid(), '{status}'=>WorkerApp::getInstance()->serverStatus],
+        WorkerApp::getInstance()->setWorkerStatus(WorkerApp::WORKERLASTACK);
+        Log::warning("worker {worker_id} exec last ack at tick, and current app status is {status}.",
+            ['{worker_id}' => posix_getpid(), '{status}' => WorkerApp::getInstance()->serverStatus],
             WorkerApp::getInstance()->debugDirName);
     }
-
+    
     /**
-     * 获取worker停止的flag
+     * 获取worker状态
      * @return int
      */
-    public function getListenWokerStopFlag()
+    private function getWokerStopFlag()
     {
         return $this->wokerStopFlag;
     }
-
+    
+    /**
+     * @param int $flag
+     * 设置worker状态
+     */
+    private function setWokerStopFlag(int $flag)
+    {
+        $this->wokerStopFlag = $flag;
+    }
+    
     /* NO-OP: not required in PhpAmqpLib */
     function Connect($connection)
     {
     }
-
+    
     /**
      * Return an AMQPTable from a given array
      * @param array $headers Associative array of headers to convert to a table
@@ -349,7 +384,7 @@ class AMQPLibConnector extends AbstractAMQPConnector
     {
         return new AMQPTable($headers);
     }
-
+    
     /**
      * Post a task to exchange specified in $details
      * @param AMQPConnection $connection Connection object
@@ -359,19 +394,34 @@ class AMQPLibConnector extends AbstractAMQPConnector
      */
     function PostToExchange($connection, $details, $task, $params, $headers)
     {
-        $chan = $this->popChan($this->connectionDetails['exchange'],0.01);
+        $chan = $this->popChan($this->connectionDetails['exchange'], 0.01, 100);
         $application_headers = $this->HeadersToTable($headers);
         $params['application_headers'] = $application_headers;
-        $msg = new AMQPMessage(
-            $task,
-            $params
-        );
-        $chan->basic_publish($msg, $details['exchange'], $details['routing_key']);
+        try {
+            $msg = new AMQPMessage(
+                $task,
+                $params
+            );
+            !empty($chan) && $chan->basic_publish($msg, $details['exchange'], $details['routing_key']);
+        } catch (AMQPRuntimeException $e) {
+            //清除老对象的定时器
+            $this->cleanTimer();
+            //运行时异常关闭链接
+            $this->connection->close();
+            throw $e;
+        } catch (AMQPTimeoutException $e) {
+            //清除老对象的定时器
+            $this->cleanTimer();
+            //从新生产对象, 这里如果是因为超时并收到rst标志位导致的链接已经关闭,
+            // 这里在执行关闭会有问题, 因此采用重连并初始化chan的操作
+            $this->GetConnectionObject($this->connectionDetails);
+            throw $e;
+        }
         $this->pushChan($chan, $this->connectionDetails['exchange']);
-        unset($chan);
+        
         return true;
     }
-
+    
     /**
      * A callback function for AMQPChannel::basic_consume
      * @param PhpAmqpLib\Message\AMQPMessage $msg
@@ -380,7 +430,7 @@ class AMQPLibConnector extends AbstractAMQPConnector
     {
         $this->message = $msg;
     }
-
+    
     /**
      * Return result of task execution for $task_id
      * @param object $connection AMQPConnection object
@@ -398,7 +448,7 @@ class AMQPLibConnector extends AbstractAMQPConnector
             if (!empty($expire)) {
                 $expire_args = array("x-expires" => array("I", $expire));
             }
-
+            
             $ch->queue_declare(
                 $task_id,        /* queue name */
                 false,            /* passive */
@@ -408,7 +458,7 @@ class AMQPLibConnector extends AbstractAMQPConnector
                 false,                  /* no wait */
                 $expire_args
             );
-
+            
             $ch->basic_consume(
                 $task_id,        /* queue */
                 '',            /* consumer tag */
@@ -420,13 +470,13 @@ class AMQPLibConnector extends AbstractAMQPConnector
             );
             $this->receiving_channel = $ch;
         }
-
+        
         try {
             $this->receiving_channel->wait(null, false, $this->wait_timeout);
         } catch (PhpAmqpLib\Exception\AMQPTimeoutException $e) {
             return false;
         }
-
+        
         /* Check if the callback function saved something */
         if ($this->message) {
             if ($removeMessageFromQueue) {
@@ -434,13 +484,14 @@ class AMQPLibConnector extends AbstractAMQPConnector
             }
             $this->receiving_channel->close();
             $connection->close();
-
+            
             return array(
                 'complete_result' => $this->message,
                 'body' => $this->message->body, // JSON message body
             );
         }
-
+        
         return false;
     }
 }
+
